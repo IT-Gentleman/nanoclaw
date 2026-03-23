@@ -89,6 +89,11 @@ function createSchema(database: Database.Database): void {
       session_id TEXT PRIMARY KEY,
       model_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS isolated_sessions (
+      session_id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -552,6 +557,10 @@ export function setSession(groupFolder: string, sessionId: string): void {
   ).run(groupFolder, sessionId);
 }
 
+export function deleteSession(groupFolder: string): void {
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+}
+
 // --- Session model accessors ---
 
 export function getSessionModel(sessionId: string): string | undefined {
@@ -569,6 +578,22 @@ export function setSessionModel(sessionId: string, modelId: string): void {
 
 export function deleteSessionModel(sessionId: string): void {
   db.prepare('DELETE FROM session_models WHERE session_id = ?').run(sessionId);
+}
+
+export function markSessionIsolated(
+  sessionId: string,
+  groupFolder: string,
+): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO isolated_sessions (session_id, group_folder, created_at) VALUES (?, ?, ?)`,
+  ).run(sessionId, groupFolder, new Date().toISOString());
+}
+
+export function getIsolatedSessionIds(groupFolder: string): Set<string> {
+  const rows = db
+    .prepare('SELECT session_id FROM isolated_sessions WHERE group_folder = ?')
+    .all(groupFolder) as Array<{ session_id: string }>;
+  return new Set(rows.map((r) => r.session_id));
 }
 
 export function getAllSessions(): Record<string, string> {

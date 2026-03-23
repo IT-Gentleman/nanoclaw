@@ -9,10 +9,12 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
+  deleteTask,
   getAllTasks,
   getDueTasks,
   getTaskById,
   logTaskRun,
+  markSessionIsolated,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
@@ -33,7 +35,7 @@ export function computeNextRun(task: ScheduledTask): string | null {
 
   const now = Date.now();
 
-  if (task.schedule_type === 'cron') {
+  if (task.schedule_type === 'cron' || task.schedule_type === 'shell') {
     const interval = CronExpressionParser.parse(task.schedule_value, {
       tz: TIMEZONE,
     });
@@ -75,10 +77,66 @@ export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
+async function runShellTask(
+  task: ScheduledTask,
+  startTime: number,
+): Promise<void> {
+  const { spawn } = await import('child_process');
+  const chunks: Buffer[] = [];
+  let error: string | null = null;
+
+  await new Promise<void>((resolve) => {
+    const proc = spawn('sh', ['-c', task.prompt], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+    proc.stdout.on('data', (d: Buffer) => chunks.push(d));
+    proc.stderr.on('data', (d: Buffer) => chunks.push(d));
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        error = `Exit code ${code}`;
+      }
+      resolve();
+    });
+    proc.on('error', (err) => {
+      error = err.message;
+      resolve();
+    });
+  });
+
+  const output = Buffer.concat(chunks).toString('utf-8').slice(0, 4000);
+  const durationMs = Date.now() - startTime;
+
+  logTaskRun({
+    task_id: task.id,
+    run_at: new Date().toISOString(),
+    duration_ms: durationMs,
+    status: error ? 'error' : 'success',
+    result: error ? null : output || 'Completed',
+    error,
+  });
+
+  const nextRun = computeNextRun(task);
+  if (nextRun === null) {
+    deleteTask(task.id);
+  } else {
+    updateTaskAfterRun(
+      task.id,
+      nextRun,
+      error ? `Error: ${error}` : output.slice(0, 200) || 'Completed',
+    );
+  }
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
 ): Promise<void> {
+  if (task.schedule_type === 'shell') {
+    await runShellTask(task, Date.now());
+    return;
+  }
+
   const startTime = Date.now();
   let groupDir: string;
   try {
@@ -151,6 +209,7 @@ async function runTask(
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
+  const isIsolatedTask = task.context_mode !== 'group';
   const sessionId =
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
 
@@ -183,6 +242,9 @@ async function runTask(
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
+        if (streamedOutput.newSessionId && isIsolatedTask) {
+          markSessionIsolated(streamedOutput.newSessionId, task.group_folder);
+        }
         if (streamedOutput.result) {
           result = streamedOutput.result;
           // Forward result to user (sendMessage handles formatting)
@@ -200,6 +262,10 @@ async function runTask(
     );
 
     if (closeTimer) clearTimeout(closeTimer);
+
+    if (output.newSessionId && isIsolatedTask) {
+      markSessionIsolated(output.newSessionId, task.group_folder);
+    }
 
     if (output.status === 'error') {
       error = output.error || 'Unknown error';
@@ -235,7 +301,11 @@ async function runTask(
     : result
       ? result.slice(0, 200)
       : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+  if (nextRun === null) {
+    deleteTask(task.id);
+  } else {
+    updateTaskAfterRun(task.id, nextRun, resultSummary);
+  }
 }
 
 let schedulerRunning = false;
@@ -274,6 +344,19 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   };
 
   loop();
+}
+
+/**
+ * Immediately run a specific task by ID, bypassing the poll interval.
+ * Used for on-demand tasks (e.g. job scraping triggered by user keyboard input).
+ */
+export function triggerTaskNow(
+  taskId: string,
+  deps: SchedulerDependencies,
+): void {
+  const task = getTaskById(taskId);
+  if (!task || task.status !== 'active') return;
+  deps.queue.enqueueTask(task.chat_jid, task.id, () => runTask(task, deps));
 }
 
 /** @internal - for tests only. */

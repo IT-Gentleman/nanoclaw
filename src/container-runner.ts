@@ -33,6 +33,8 @@ import { RegisteredGroup } from './types.js';
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const PROGRESS_START_MARKER = '---NANOCLAW_PROGRESS_START---';
+const PROGRESS_END_MARKER = '---NANOCLAW_PROGRESS_END---';
 
 export interface ContainerInput {
   prompt: string;
@@ -41,6 +43,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  isCompaction?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
   model?: string;
@@ -283,6 +286,7 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onProgress?: (tool: string, preview: string) => void | Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -362,35 +366,65 @@ export async function runContainerAgent(
         }
       }
 
-      // Stream-parse for output markers
-      if (onOutput) {
+      // Stream-parse OUTPUT and PROGRESS markers in arrival order
+      if (onOutput || onProgress) {
         parseBuffer += chunk;
-        let startIdx: number;
-        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
-          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
-          if (endIdx === -1) break; // Incomplete pair, wait for more data
+        while (true) {
+          const outIdx = onOutput
+            ? parseBuffer.indexOf(OUTPUT_START_MARKER)
+            : -1;
+          const progIdx = onProgress
+            ? parseBuffer.indexOf(PROGRESS_START_MARKER)
+            : -1;
 
-          const jsonStr = parseBuffer
-            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
-            .trim();
-          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+          if (outIdx === -1 && progIdx === -1) break;
 
-          try {
-            const parsed: ContainerOutput = JSON.parse(jsonStr);
-            if (parsed.newSessionId) {
-              newSessionId = parsed.newSessionId;
-            }
-            hadStreamingOutput = true;
-            // Activity detected — reset the hard timeout
-            resetTimeout();
-            // Call onOutput for all markers (including null results)
-            // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
-          } catch (err) {
-            logger.warn(
-              { group: group.name, error: err },
-              'Failed to parse streamed output chunk',
+          // Process whichever marker arrives first
+          const takeProgress =
+            progIdx !== -1 && (outIdx === -1 || progIdx < outIdx);
+          if (takeProgress) {
+            const progEnd = parseBuffer.indexOf(PROGRESS_END_MARKER, progIdx);
+            if (progEnd === -1) break; // Incomplete, wait for more data
+            const jsonStr = parseBuffer
+              .slice(progIdx + PROGRESS_START_MARKER.length, progEnd)
+              .trim();
+            parseBuffer = parseBuffer.slice(
+              progEnd + PROGRESS_END_MARKER.length,
             );
+            try {
+              const prog = JSON.parse(jsonStr);
+              outputChain = outputChain.then(() =>
+                Promise.resolve(
+                  onProgress!(prog.tool || '', prog.preview || ''),
+                ),
+              );
+            } catch {
+              /* ignore malformed progress */
+            }
+          } else {
+            const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, outIdx);
+            if (endIdx === -1) break; // Incomplete pair, wait for more data
+            const jsonStr = parseBuffer
+              .slice(outIdx + OUTPUT_START_MARKER.length, endIdx)
+              .trim();
+            parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+            try {
+              const parsed: ContainerOutput = JSON.parse(jsonStr);
+              if (parsed.newSessionId) {
+                newSessionId = parsed.newSessionId;
+              }
+              hadStreamingOutput = true;
+              // Activity detected — reset the hard timeout
+              resetTimeout();
+              // Call onOutput for all markers (including null results)
+              // so idle timers start even for "silent" query completions.
+              outputChain = outputChain.then(() => onOutput!(parsed));
+            } catch (err) {
+              logger.warn(
+                { group: group.name, error: err },
+                'Failed to parse streamed output chunk',
+              );
+            }
           }
         }
       }
@@ -570,6 +604,21 @@ export async function runContainerAgent(
       logger.debug({ logFile, verbose: isVerbose }, 'Container log written');
 
       if (code !== 0) {
+        // If streaming output was already received, the agent completed its work.
+        // The non-zero exit (e.g. code 137/SIGKILL) is the container runtime
+        // killing the process after stdin was closed — not a task failure.
+        // Wait for the output chain to settle then resolve as success.
+        if (hadStreamingOutput && onOutput) {
+          logger.warn(
+            { group: group.name, code, duration },
+            'Container exited non-zero after streaming output — treating as success (cleanup kill)',
+          );
+          outputChain.then(() => {
+            resolve({ status: 'success', result: null, newSessionId });
+          });
+          return;
+        }
+
         logger.error(
           {
             group: group.name,

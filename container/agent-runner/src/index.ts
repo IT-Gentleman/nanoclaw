@@ -27,6 +27,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  isCompaction?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
   model?: string;
@@ -91,6 +92,18 @@ class MessageStream {
     this.waiting?.();
   }
 
+  /** Drain any unconsumed messages from the buffer (text only). */
+  drainPending(): string[] {
+    const texts: string[] = [];
+    while (this.queue.length > 0) {
+      const msg = this.queue.shift()!;
+      if (msg.message && 'content' in msg.message && typeof msg.message.content === 'string') {
+        texts.push(msg.message.content);
+      }
+    }
+    return texts;
+  }
+
   async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
     while (true) {
       while (this.queue.length > 0) {
@@ -115,6 +128,8 @@ async function readStdin(): Promise<string> {
 
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const PROGRESS_START_MARKER = '---NANOCLAW_PROGRESS_START---';
+const PROGRESS_END_MARKER = '---NANOCLAW_PROGRESS_END---';
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
@@ -124,6 +139,32 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+function getToolPreview(toolName: string, input: unknown): string {
+  if (!input || typeof input !== 'object') return '';
+  const inp = input as Record<string, unknown>;
+  const str = (v: unknown) => String(v ?? '').slice(0, 120);
+  switch (toolName) {
+    case 'Bash': return str(inp.command);
+    case 'Read': return str(inp.file_path);
+    case 'Write': return str(inp.file_path);
+    case 'Edit': return str(inp.file_path);
+    case 'Glob': return str(inp.pattern);
+    case 'Grep': return str(inp.pattern);
+    case 'WebFetch': return str(inp.url);
+    case 'WebSearch': return str(inp.query);
+    default: {
+      const first = Object.values(inp)[0];
+      return first ? str(first) : '';
+    }
+  }
+}
+
+function writeProgress(tool: string, preview: string): void {
+  console.log(PROGRESS_START_MARKER);
+  console.log(JSON.stringify({ tool, preview }));
+  console.log(PROGRESS_END_MARKER);
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -345,9 +386,14 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; stream: MessageStream }> {
   const stream = new MessageStream();
   stream.push(prompt);
+  // For compaction, end the stream immediately — /compact is a one-shot command.
+  // Without this, the SDK waits for more messages indefinitely (no _close sentinel is written).
+  if (containerInput.isCompaction) {
+    stream.end();
+  }
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
@@ -410,7 +456,7 @@ async function runQuery(
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
-      allowedTools: [
+      allowedTools: containerInput.isCompaction ? [] : [
         'Bash',
         'Read', 'Write', 'Edit', 'Glob', 'Grep',
         'WebSearch', 'WebFetch',
@@ -446,6 +492,17 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+    }
+
+    if (message.type === 'assistant') {
+      const content = (message as any).message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_use') {
+            writeProgress(block.name, getToolPreview(block.name, block.input));
+          }
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -485,7 +542,7 @@ async function runQuery(
 
   ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, stream };
 }
 
 async function main(): Promise<void> {
@@ -567,6 +624,19 @@ async function main(): Promise<void> {
 
       // Emit session update so host can track it
       writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+
+      // Check for messages that arrived during the query but weren't consumed
+      // (e.g. pushed to stream while Claude was finishing its turn).
+      // Also drain any new IPC files that arrived after polling stopped.
+      const leftover = queryResult.stream.drainPending();
+      const freshIpc = drainIpcInput();
+      const pendingAfterQuery = [...leftover.map(t => t), ...freshIpc];
+
+      if (pendingAfterQuery.length > 0) {
+        log(`Found ${pendingAfterQuery.length} pending messages after query (${leftover.length} from stream, ${freshIpc.length} from IPC), starting new query`);
+        prompt = pendingAfterQuery.join('\n');
+        continue;
+      }
 
       log('Query ended, waiting for next IPC message...');
 
