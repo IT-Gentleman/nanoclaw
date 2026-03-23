@@ -27,6 +27,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  model?: string;
 }
 
 interface ContainerOutput {
@@ -34,6 +35,12 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  usedModel?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
+  totalCostUsd?: number;
 }
 
 interface SessionEntry {
@@ -362,6 +369,7 @@ async function runQuery(
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
 
   let newSessionId: string | undefined;
+  let usedModel: string | undefined;
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
@@ -391,6 +399,7 @@ async function runQuery(
 
   for await (const message of query({
     prompt: stream,
+    ...(containerInput.model ? { model: containerInput.model } : {}),
     options: {
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
@@ -439,7 +448,8 @@ async function runQuery(
 
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
+      usedModel = (message as any).model as string | undefined;
+      log(`Session initialized: ${newSessionId}${usedModel ? `, model: ${usedModel}` : ''}`);
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -450,11 +460,23 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const resultMsg = message as {
+        result?: string;
+        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+        total_cost_usd?: number;
+      };
+      const usage = resultMsg.usage;
+      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}${usage ? ` tokens=${usage.input_tokens}+${usage.output_tokens}` : ''}`);
       writeOutput({
         status: 'success',
         result: textResult || null,
-        newSessionId
+        newSessionId,
+        usedModel,
+        inputTokens: usage?.input_tokens,
+        outputTokens: usage?.output_tokens,
+        cacheReadTokens: usage?.cache_read_input_tokens,
+        cacheCreationTokens: usage?.cache_creation_input_tokens,
+        totalCostUsd: resultMsg.total_cost_usd,
       });
     }
   }

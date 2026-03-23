@@ -73,6 +73,10 @@ function createSchema(database: Database.Database): void {
       group_folder TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS session_models (
+      session_id TEXT PRIMARY KEY,
+      model_id TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -83,6 +87,15 @@ function createSchema(database: Database.Database): void {
       requires_trigger INTEGER DEFAULT 1
     );
   `);
+
+  // Add model column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN model TEXT DEFAULT NULL`,
+    );
+  } catch {
+    /* column already exists */
+  }
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
   try {
@@ -368,8 +381,8 @@ export function createTask(
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, model, next_run, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -379,6 +392,7 @@ export function createTask(
     task.schedule_type,
     task.schedule_value,
     task.context_mode || 'isolated',
+    task.model ?? null,
     task.next_run,
     task.status,
     task.created_at,
@@ -524,6 +538,25 @@ export function setSession(groupFolder: string, sessionId: string): void {
   db.prepare(
     'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
   ).run(groupFolder, sessionId);
+}
+
+// --- Session model accessors ---
+
+export function getSessionModel(sessionId: string): string | undefined {
+  const row = db
+    .prepare('SELECT model_id FROM session_models WHERE session_id = ?')
+    .get(sessionId) as { model_id: string } | undefined;
+  return row?.model_id;
+}
+
+export function setSessionModel(sessionId: string, modelId: string): void {
+  db.prepare(
+    'INSERT OR REPLACE INTO session_models (session_id, model_id) VALUES (?, ?)',
+  ).run(sessionId, modelId);
+}
+
+export function deleteSessionModel(sessionId: string): void {
+  db.prepare('DELETE FROM session_models WHERE session_id = ?').run(sessionId);
 }
 
 export function getAllSessions(): Record<string, string> {
