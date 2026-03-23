@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
@@ -27,6 +28,7 @@ interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
+  secrets?: Record<string, string>;
 }
 
 interface ContainerOutput {
@@ -484,6 +486,20 @@ async function main(): Promise<void> {
   // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
   // No real secrets exist in the container environment.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
+
+  // Configure git credentials from GITHUB_TOKEN so git push/pull works over HTTPS
+  const githubToken = containerInput.secrets?.GITHUB_TOKEN;
+  const gitUserName = containerInput.secrets?.GIT_USER_NAME;
+  const gitUserEmail = containerInput.secrets?.GIT_USER_EMAIL;
+  if (githubToken) {
+    const home = process.env.HOME || '/home/node';
+    fs.writeFileSync(`${home}/.git-credentials`, `https://x-access-token:${githubToken}@github.com\n`, { mode: 0o600 });
+    execSync('git config --global credential.helper store', { stdio: 'ignore' });
+    execSync('git config --global safe.directory "*"', { stdio: 'ignore' });
+    if (gitUserName) execSync(`git config --global user.name ${JSON.stringify(gitUserName)}`, { stdio: 'ignore' });
+    if (gitUserEmail) execSync(`git config --global user.email ${JSON.stringify(gitUserEmail)}`, { stdio: 'ignore' });
+    log('Git credentials configured from GITHUB_TOKEN');
+  }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
