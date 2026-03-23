@@ -73,6 +73,24 @@ function createSchema(database: Database.Database): void {
       group_folder TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS isolated_sessions (
+      session_id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS session_models (
+      session_id TEXT PRIMARY KEY,
+      model_id TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS registered_groups (
+      jid TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      folder TEXT NOT NULL UNIQUE,
+      trigger_pattern TEXT NOT NULL,
+      added_at TEXT NOT NULL,
+      container_config TEXT,
+      requires_trigger INTEGER DEFAULT 1
+    );
     CREATE TABLE IF NOT EXISTS usage_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       group_folder TEXT NOT NULL,
@@ -85,39 +103,23 @@ function createSchema(database: Database.Database): void {
       cost_usd REAL NOT NULL DEFAULT 0,
       recorded_at TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS session_models (
-      session_id TEXT PRIMARY KEY,
-      model_id TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS isolated_sessions (
-      session_id TEXT PRIMARY KEY,
-      group_folder TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS registered_groups (
-      jid TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      folder TEXT NOT NULL UNIQUE,
-      trigger_pattern TEXT NOT NULL,
-      added_at TEXT NOT NULL,
-      container_config TEXT,
-      requires_trigger INTEGER DEFAULT 1
-    );
+    CREATE INDEX IF NOT EXISTS idx_usage_logs_group ON usage_logs(group_folder, recorded_at);
+    CREATE INDEX IF NOT EXISTS idx_usage_logs_recorded ON usage_logs(recorded_at);
   `);
-
-  // Add model column if it doesn't exist (migration for existing DBs)
-  try {
-    database.exec(
-      `ALTER TABLE scheduled_tasks ADD COLUMN model TEXT DEFAULT NULL`,
-    );
-  } catch {
-    /* column already exists */
-  }
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
       `ALTER TABLE scheduled_tasks ADD COLUMN context_mode TEXT DEFAULT 'isolated'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add model column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN model TEXT DEFAULT NULL`,
     );
   } catch {
     /* column already exists */
@@ -561,6 +563,17 @@ export function deleteSession(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }
 
+export function getAllSessions(): Record<string, string> {
+  const rows = db
+    .prepare('SELECT group_folder, session_id FROM sessions')
+    .all() as Array<{ group_folder: string; session_id: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    result[row.group_folder] = row.session_id;
+  }
+  return result;
+}
+
 // --- Session model accessors ---
 
 export function getSessionModel(sessionId: string): string | undefined {
@@ -594,17 +607,6 @@ export function getIsolatedSessionIds(groupFolder: string): Set<string> {
     .prepare('SELECT session_id FROM isolated_sessions WHERE group_folder = ?')
     .all(groupFolder) as Array<{ session_id: string }>;
   return new Set(rows.map((r) => r.session_id));
-}
-
-export function getAllSessions(): Record<string, string> {
-  const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
-  const result: Record<string, string> = {};
-  for (const row of rows) {
-    result[row.group_folder] = row.session_id;
-  }
-  return result;
 }
 
 // --- Registered group accessors ---

@@ -12,6 +12,7 @@ vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  DATA_DIR: '/tmp/nanoclaw-test-data',
 }));
 
 // Mock logger
@@ -31,6 +32,16 @@ type Handler = (...args: any[]) => any;
 const botRef = vi.hoisted(() => ({ current: null as any }));
 
 vi.mock('grammy', () => ({
+  InlineKeyboard: class MockInlineKeyboard {
+    private rows: any[][] = [[]];
+    text(_label: string, _data: string) {
+      return this;
+    }
+    row() {
+      this.rows.push([]);
+      return this;
+    }
+  },
   Bot: class MockBot {
     token: string;
     commandHandlers = new Map<string, Handler>();
@@ -38,8 +49,11 @@ vi.mock('grammy', () => ({
     errorHandler: Handler | null = null;
 
     api = {
-      sendMessage: vi.fn().mockResolvedValue(undefined),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 42 }),
       sendChatAction: vi.fn().mockResolvedValue(undefined),
+      setMyCommands: vi.fn().mockResolvedValue(undefined),
+      editMessageText: vi.fn().mockResolvedValue(undefined),
+      editMessageReplyMarkup: vi.fn().mockResolvedValue(undefined),
     };
 
     constructor(token: string) {
@@ -59,6 +73,12 @@ vi.mock('grammy', () => ({
 
     catch(handler: Handler) {
       this.errorHandler = handler;
+    }
+
+    callbackQueryHandlers: Array<{ filter: any; handler: Handler }> = [];
+
+    callbackQuery(filter: any, handler: Handler) {
+      this.callbackQueryHandlers.push({ filter, handler });
     }
 
     start(opts: { onStart: (botInfo: any) => void }) {
@@ -166,6 +186,20 @@ function currentBot() {
 async function triggerTextMessage(ctx: ReturnType<typeof createTextCtx>) {
   const handlers = currentBot().filterHandlers.get('message:text') || [];
   for (const h of handlers) await h(ctx);
+}
+
+async function triggerCallbackQuery(callbackData: string, ctx: any) {
+  const bot = currentBot();
+  for (const { filter, handler } of bot.callbackQueryHandlers) {
+    if (filter instanceof RegExp) {
+      const match = callbackData.match(filter);
+      if (match) {
+        await handler({ ...ctx, match });
+      }
+    } else if (filter === callbackData) {
+      await handler(ctx);
+    }
+  }
 }
 
 async function triggerMediaMessage(
@@ -295,29 +329,16 @@ describe('TelegramChannel', () => {
       expect(opts.onMessage).not.toHaveBeenCalled();
     });
 
-    it('skips bot commands (/chatid, /ping) but passes other / messages through', async () => {
+    it('skips command messages (starting with /)', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
-      // Bot commands should be skipped
-      const ctx1 = createTextCtx({ text: '/chatid' });
-      await triggerTextMessage(ctx1);
+      const ctx = createTextCtx({ text: '/start' });
+      await triggerTextMessage(ctx);
+
       expect(opts.onMessage).not.toHaveBeenCalled();
       expect(opts.onChatMetadata).not.toHaveBeenCalled();
-
-      const ctx2 = createTextCtx({ text: '/ping' });
-      await triggerTextMessage(ctx2);
-      expect(opts.onMessage).not.toHaveBeenCalled();
-
-      // Non-bot /commands should flow through
-      const ctx3 = createTextCtx({ text: '/remote-control' });
-      await triggerTextMessage(ctx3);
-      expect(opts.onMessage).toHaveBeenCalledTimes(1);
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'tg:100200300',
-        expect.objectContaining({ content: '/remote-control' }),
-      );
     });
 
     it('extracts sender name from first_name', async () => {
@@ -723,7 +744,6 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '100200300',
         'Hello',
-        { parse_mode: 'Markdown' },
       );
     });
 
@@ -737,7 +757,6 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '-1001234567890',
         'Group message',
-        { parse_mode: 'Markdown' },
       );
     });
 
@@ -754,13 +773,11 @@ describe('TelegramChannel', () => {
         1,
         '100200300',
         'x'.repeat(4096),
-        { parse_mode: 'Markdown' },
       );
       expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
         2,
         '100200300',
         'x'.repeat(904),
-        { parse_mode: 'Markdown' },
       );
     });
 
@@ -944,6 +961,147 @@ describe('TelegramChannel', () => {
     it('has name "telegram"', () => {
       const channel = new TelegramChannel('test-token', createTestOpts());
       expect(channel.name).toBe('telegram');
+    });
+  });
+
+  // --- Job keyboard ---
+
+  describe('job keyboard', () => {
+    const sampleJobs = [
+      {
+        id: 1,
+        title: 'Job A',
+        url: 'https://example.com/1',
+        date: '2024-01-01',
+      },
+      {
+        id: 2,
+        title: 'Job B',
+        url: 'https://example.com/2',
+        date: '2024-01-02',
+      },
+    ];
+
+    function makeCallbackCtx(
+      callbackData: string,
+      markupButtons: any[][] = [],
+    ) {
+      return {
+        chat: { id: 100200300 },
+        callbackQuery: {
+          message: {
+            chat: { id: 100200300 },
+            reply_markup: { inline_keyboard: markupButtons },
+          },
+          data: callbackData,
+        },
+        editMessageReplyMarkup: vi.fn().mockResolvedValue(undefined),
+        answerCallbackQuery: vi.fn().mockResolvedValue(undefined),
+      };
+    }
+
+    it('sendJobKeyboard sends text list then keyboard', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendJobKeyboard('tg:100200300', 'Pick jobs', sampleJobs);
+
+      const calls = (currentBot().api.sendMessage as any).mock.calls;
+      // First call: text list with numbered jobs
+      expect(calls[0][0]).toBe('100200300');
+      expect(calls[0][1]).toContain('Pick jobs');
+      expect(calls[0][1]).toContain('Job A');
+      // Second call: inline keyboard for selection
+      expect(calls[1][0]).toBe('100200300');
+      expect(calls[1][2]).toEqual(
+        expect.objectContaining({ reply_markup: expect.anything() }),
+      );
+    });
+
+    it('job_toggle toggles ✅ on unselected job', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendJobKeyboard('tg:100200300', 'Pick jobs', sampleJobs);
+
+      const buttons: any[][] = [
+        [{ text: '☐ Job A', callback_data: 'job_toggle:1' }],
+        [{ text: '☐ Job B', callback_data: 'job_toggle:2' }],
+        [
+          { text: '확인 (0개 선택)', callback_data: 'job_confirm' },
+          { text: '전체 건너뛰기', callback_data: 'job_skipall' },
+        ],
+      ];
+      const ctx = makeCallbackCtx('job_toggle:1', buttons);
+      await triggerCallbackQuery('job_toggle:1', ctx);
+
+      expect(ctx.editMessageReplyMarkup).toHaveBeenCalled();
+      expect(ctx.answerCallbackQuery).toHaveBeenCalled();
+    });
+
+    it('job_confirm fires onJobConfirm with selected/skipped', async () => {
+      const onJobConfirm = vi.fn().mockResolvedValue(undefined);
+      const opts = createTestOpts({ onJobConfirm });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendJobKeyboard('tg:100200300', 'Pick jobs', sampleJobs);
+
+      // Simulate job 1 selected (✅), job 2 not selected
+      const buttons: any[][] = [
+        [{ text: '✅ Job A', callback_data: 'job_toggle:1' }],
+        [{ text: '☐ Job B', callback_data: 'job_toggle:2' }],
+        [
+          { text: '확인 (1개 선택)', callback_data: 'job_confirm' },
+          { text: '전체 건너뛰기', callback_data: 'job_skipall' },
+        ],
+      ];
+      const ctx = makeCallbackCtx('job_confirm', buttons);
+      await triggerCallbackQuery('job_confirm', ctx);
+
+      expect(ctx.editMessageReplyMarkup).toHaveBeenCalled();
+      expect(ctx.answerCallbackQuery).toHaveBeenCalledWith(
+        '스크랩을 시작합니다...',
+      );
+      expect(onJobConfirm).toHaveBeenCalledWith(
+        'tg:100200300',
+        [sampleJobs[0]],
+        [sampleJobs[1]],
+      );
+    });
+
+    it('job_confirm does not fire onJobConfirm when nothing selected', async () => {
+      const onJobConfirm = vi.fn().mockResolvedValue(undefined);
+      const opts = createTestOpts({ onJobConfirm });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendJobKeyboard('tg:100200300', 'Pick jobs', sampleJobs);
+
+      const buttons: any[][] = [
+        [{ text: '☐ Job A', callback_data: 'job_toggle:1' }],
+        [{ text: '☐ Job B', callback_data: 'job_toggle:2' }],
+      ];
+      const ctx = makeCallbackCtx('job_confirm', buttons);
+      await triggerCallbackQuery('job_confirm', ctx);
+
+      expect(onJobConfirm).not.toHaveBeenCalled();
+    });
+
+    it('job_skipall clears pendingJobs and disables keyboard', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendJobKeyboard('tg:100200300', 'Pick jobs', sampleJobs);
+
+      const ctx = makeCallbackCtx('job_skipall');
+      await triggerCallbackQuery('job_skipall', ctx);
+
+      expect(ctx.editMessageReplyMarkup).toHaveBeenCalled();
+      expect(ctx.answerCallbackQuery).toHaveBeenCalledWith('건너뛰었습니다.');
     });
   });
 });

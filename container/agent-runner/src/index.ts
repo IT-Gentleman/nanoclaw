@@ -17,7 +17,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
 interface ContainerInput {
@@ -29,8 +29,8 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   isCompaction?: boolean;
   assistantName?: string;
-  secrets?: Record<string, string>;
   model?: string;
+  secrets?: Record<string, string>;
 }
 
 interface ContainerOutput {
@@ -630,11 +630,11 @@ async function main(): Promise<void> {
       // Also drain any new IPC files that arrived after polling stopped.
       const leftover = queryResult.stream.drainPending();
       const freshIpc = drainIpcInput();
-      const pendingAfterQuery = [...leftover.map(t => t), ...freshIpc];
+      const pending = [...leftover.map(t => t), ...freshIpc];
 
-      if (pendingAfterQuery.length > 0) {
-        log(`Found ${pendingAfterQuery.length} pending messages after query (${leftover.length} from stream, ${freshIpc.length} from IPC), starting new query`);
-        prompt = pendingAfterQuery.join('\n');
+      if (pending.length > 0) {
+        log(`Found ${pending.length} pending messages after query (${leftover.length} from stream, ${freshIpc.length} from IPC), starting new query`);
+        prompt = pending.join('\n');
         continue;
       }
 

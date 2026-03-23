@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { stopContainer } from './container-runtime.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -66,7 +67,18 @@ export class GroupQueue {
 
     if (state.active) {
       state.pendingMessages = true;
-      logger.debug({ groupJid }, 'Container active, message queued');
+      // If a background task container is running, close its stdin so it
+      // winds down quickly — user messages should not wait 30min for a
+      // stuck/slow task to finish.
+      if (state.isTaskContainer) {
+        logger.info(
+          { groupJid, taskId: state.runningTaskId },
+          'User message arrived during task, closing task stdin for priority',
+        );
+        this.closeStdin(groupJid);
+      } else {
+        logger.debug({ groupJid }, 'Container active, message queued');
+      }
       return;
     }
 
@@ -175,6 +187,28 @@ export class GroupQueue {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Immediately kill the active container process and stop the container.
+   * Use for misbehaving containers or hard timeouts.
+   * Returns true if a container was active and killed.
+   */
+  forceStop(groupJid: string): boolean {
+    const state = this.getGroup(groupJid);
+    if (!state.active) return false;
+
+    if (state.process && !state.process.killed) {
+      state.process.kill('SIGKILL');
+    }
+    if (state.containerName) {
+      stopContainer(state.containerName);
+    }
+    logger.info(
+      { groupJid, containerName: state.containerName },
+      'Container force stopped',
+    );
+    return true;
   }
 
   /**
@@ -288,24 +322,24 @@ export class GroupQueue {
 
     const state = this.getGroup(groupJid);
 
-    // Tasks first (they won't be re-discovered from SQLite like messages)
+    // Messages first — user-facing messages should never wait behind background tasks
+    if (state.pendingMessages) {
+      this.runForGroup(groupJid, 'drain').catch((err) =>
+        logger.error(
+          { groupJid, err },
+          'Unhandled error in runForGroup (drain)',
+        ),
+      );
+      return;
+    }
+
+    // Then background tasks
     if (state.pendingTasks.length > 0) {
       const task = state.pendingTasks.shift()!;
       this.runTask(groupJid, task).catch((err) =>
         logger.error(
           { groupJid, taskId: task.id, err },
           'Unhandled error in runTask (drain)',
-        ),
-      );
-      return;
-    }
-
-    // Then pending messages
-    if (state.pendingMessages) {
-      this.runForGroup(groupJid, 'drain').catch((err) =>
-        logger.error(
-          { groupJid, err },
-          'Unhandled error in runForGroup (drain)',
         ),
       );
       return;
@@ -323,20 +357,20 @@ export class GroupQueue {
       const nextJid = this.waitingGroups.shift()!;
       const state = this.getGroup(nextJid);
 
-      // Prioritize tasks over messages
-      if (state.pendingTasks.length > 0) {
+      // Prioritize messages over background tasks
+      if (state.pendingMessages) {
+        this.runForGroup(nextJid, 'drain').catch((err) =>
+          logger.error(
+            { groupJid: nextJid, err },
+            'Unhandled error in runForGroup (waiting)',
+          ),
+        );
+      } else if (state.pendingTasks.length > 0) {
         const task = state.pendingTasks.shift()!;
         this.runTask(nextJid, task).catch((err) =>
           logger.error(
             { groupJid: nextJid, taskId: task.id, err },
             'Unhandled error in runTask (waiting)',
-          ),
-        );
-      } else if (state.pendingMessages) {
-        this.runForGroup(nextJid, 'drain').catch((err) =>
-          logger.error(
-            { groupJid: nextJid, err },
-            'Unhandled error in runForGroup (waiting)',
           ),
         );
       }

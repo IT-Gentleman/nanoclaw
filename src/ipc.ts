@@ -10,8 +10,16 @@ import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
+export interface JobEntry {
+  id: number;
+  title: string;
+  url: string;
+  date?: string;
+}
+
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendKeyboard?: (jid: string, text: string, jobs: JobEntry[]) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -23,6 +31,27 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+}
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  maxRetries = 3,
+): Promise<T> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+      const delayMs = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+      logger.warn(
+        { attempt, maxRetries, delayMs, label, err },
+        'IPC send failed, retrying',
+      );
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw new Error('unreachable');
 }
 
 let ipcWatcherRunning = false;
@@ -81,7 +110,10 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  await withRetry(
+                    () => deps.sendMessage(data.chatJid, data.text),
+                    `sendMessage(${data.chatJid})`,
+                  );
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',
@@ -90,6 +122,38 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'keyboard_message' &&
+                data.chatJid &&
+                data.text &&
+                Array.isArray(data.jobs)
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  if (deps.sendKeyboard) {
+                    await withRetry(
+                      () =>
+                        deps.sendKeyboard!(
+                          data.chatJid,
+                          data.text,
+                          data.jobs as JobEntry[],
+                        ),
+                      `sendKeyboard(${data.chatJid})`,
+                    );
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'IPC keyboard message sent',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC keyboard_message blocked',
                   );
                 }
               }
@@ -210,10 +274,14 @@ export async function processTaskIpc(
           break;
         }
 
-        const scheduleType = data.schedule_type as 'cron' | 'interval' | 'once';
+        const scheduleType = data.schedule_type as
+          | 'cron'
+          | 'interval'
+          | 'once'
+          | 'shell';
 
         let nextRun: string | null = null;
-        if (scheduleType === 'cron') {
+        if (scheduleType === 'cron' || scheduleType === 'shell') {
           try {
             const interval = CronExpressionParser.parse(data.schedule_value, {
               tz: TIMEZONE,
@@ -356,7 +424,8 @@ export async function processTaskIpc(
           updates.schedule_type = data.schedule_type as
             | 'cron'
             | 'interval'
-            | 'once';
+            | 'once'
+            | 'shell';
         if (data.schedule_value !== undefined)
           updates.schedule_value = data.schedule_value;
 
@@ -366,7 +435,10 @@ export async function processTaskIpc(
             ...task,
             ...updates,
           };
-          if (updatedTask.schedule_type === 'cron') {
+          if (
+            updatedTask.schedule_type === 'cron' ||
+            updatedTask.schedule_type === 'shell'
+          ) {
             try {
               const interval = CronExpressionParser.parse(
                 updatedTask.schedule_value,
