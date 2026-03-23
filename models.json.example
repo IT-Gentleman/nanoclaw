@@ -1,0 +1,5 @@
+[
+  { "id": "claude-opus-4-6",           "alias": "opus",   "label": "Opus 4.6   (최고 성능)" },
+  { "id": "claude-sonnet-4-6",         "alias": "sonnet", "label": "Sonnet 4.6 (기본)" },
+  { "id": "claude-haiku-4-5-20251001", "alias": "haiku",  "label": "Haiku 4.5  (빠름/저렴)" }
+]
