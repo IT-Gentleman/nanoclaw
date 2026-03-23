@@ -73,6 +73,18 @@ function createSchema(database: Database.Database): void {
       group_folder TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS usage_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_folder TEXT NOT NULL,
+      session_id TEXT,
+      model_id TEXT,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      cost_usd REAL NOT NULL DEFAULT 0,
+      recorded_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -632,6 +644,97 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Usage log accessors ---
+
+export interface UsageRecord {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+}
+
+export interface UsageSummary {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+  byModel: Record<
+    string,
+    { inputTokens: number; outputTokens: number; costUsd: number }
+  >;
+}
+
+export function recordUsage(
+  groupFolder: string,
+  sessionId: string | undefined,
+  modelId: string | undefined,
+  usage: UsageRecord,
+): void {
+  db.prepare(
+    `INSERT INTO usage_logs (group_folder, session_id, model_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, recorded_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    groupFolder,
+    sessionId ?? null,
+    modelId ?? null,
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cacheReadTokens,
+    usage.cacheCreationTokens,
+    usage.costUsd,
+    new Date().toISOString(),
+  );
+}
+
+export function getUsageSummary(
+  groupFolder: string,
+  since: Date,
+): UsageSummary {
+  const rows = db
+    .prepare(
+      `SELECT model_id, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd
+       FROM usage_logs WHERE group_folder = ? AND recorded_at >= ?`,
+    )
+    .all(groupFolder, since.toISOString()) as Array<{
+    model_id: string | null;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    cache_creation_tokens: number;
+    cost_usd: number;
+  }>;
+
+  const summary: UsageSummary = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    costUsd: 0,
+    byModel: {},
+  };
+  for (const row of rows) {
+    summary.inputTokens += row.input_tokens;
+    summary.outputTokens += row.output_tokens;
+    summary.cacheReadTokens += row.cache_read_tokens;
+    summary.cacheCreationTokens += row.cache_creation_tokens;
+    summary.costUsd += row.cost_usd;
+    const modelKey = row.model_id ?? 'unknown';
+    if (!summary.byModel[modelKey]) {
+      summary.byModel[modelKey] = {
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+      };
+    }
+    summary.byModel[modelKey].inputTokens += row.input_tokens;
+    summary.byModel[modelKey].outputTokens += row.output_tokens;
+    summary.byModel[modelKey].costUsd += row.cost_usd;
+  }
+  return summary;
 }
 
 // --- JSON migration ---
