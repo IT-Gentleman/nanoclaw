@@ -20,8 +20,7 @@ if (!CHAT_JID) {
   process.exit(1);
 }
 
-const STATE_DIR = path.join(DATA_DIR, 'job-scraper');
-const STATE_FILE = path.join(STATE_DIR, 'state.json');
+const STATE_FILE = process.env.JOBS_STATE_FILE ?? path.join(DATA_DIR, 'job-scraper', 'state.json');
 const IPC_DIR = path.join(DATA_DIR, 'ipc', IPC_GROUP, 'messages');
 
 const API_BASE = process.env.JOBS_API_BASE ?? 'https://inthiswork.com/wp-json/wp/v2/posts';
@@ -59,7 +58,7 @@ function loadState(): State {
 }
 
 function saveState(state: State): void {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
   const tmp = STATE_FILE + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
   fs.renameSync(tmp, STATE_FILE);
