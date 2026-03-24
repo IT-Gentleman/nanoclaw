@@ -1,39 +1,32 @@
 #!/usr/bin/env node
 /**
  * job-scraper/scraper.mjs
- * inthiswork.com 채용공고 탐색 및 레지스트리 관리
+ * inthiswork.com 채용공고 탐색 및 스크랩
  *
  * 명령어:
- *   init                  — 필요 디렉토리 및 파일 초기화
- *   discover              — 신규 공고 탐색 (레지스트리 미등록 항목만)
+ *   init                  — 필요 디렉토리 초기화
+ *   discover [page]       — 신규 공고 탐색 후 keyboard_message IPC 작성 (page>1: 과거 백필)
  *   fetch-post <id>       — 특정 공고 내용 가져오기
- *   mark-scraped <url>    — URL을 스크랩 완료로 마킹
- *   mark-seen <url>       — URL을 확인함으로 마킹 (저장 없이 건너뜀)
+ *   next-seq              — 다음 파일 시퀀스 번호 반환
  *
- * 의존성: Node.js 내장 모듈만 사용 (https, fs, path, url)
+ * 의존성: Node.js 내장 모듈만 사용 (https, fs, path)
  */
 
 import https from 'https';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
 
 // ─── 경로 설정 ───────────────────────────────────────────────────────────────
 
 const OBSIDIAN_ROOT = '/workspace/extra/obsidian';
 const CAREER_DIR = path.join(OBSIDIAN_ROOT, 'A.Career');
-const REGISTRY_FILE = path.join(CAREER_DIR, '.job-registry.json');
-const CONFIG_FILE = path.join(CAREER_DIR, '.job-scraper-config.json');
+const STATE_FILE = path.join(CAREER_DIR, '.job-scraper-state.json');
+const IPC_MESSAGES_DIR = '/workspace/ipc/messages';
 
 // inthiswork WordPress REST API
 const API_BASE = 'https://inthiswork.com/wp-json/wp/v2';
-// 카테고리 ID: 신입/인턴=191700167, 주니어경력=191700168
 const DEFAULT_CATEGORIES = '191700167,191700168';
-// 태그 ID: 대기업=191700264, 공공기관=191700269, IT개발=191700187, 공채=191700391
-// categories AND tags 조합 → 해당 카테고리 중 해당 태그가 붙은 것만 반환
 const DEFAULT_TAGS = '191700264,191700269,191700187,191700391';
-const FIELDS = 'id,title,link,date,tags,tag_slugs';
-const FIELDS_WITH_CONTENT = 'id,title,link,date,content,tags,tag_slugs';
 const PER_PAGE = 100;
 
 // ─── HTTP 헬퍼 ───────────────────────────────────────────────────────────────
@@ -113,67 +106,20 @@ function stripHtml(html) {
     .trim();
 }
 
-// ─── 레지스트리 ──────────────────────────────────────────────────────────────
+// ─── 상태 파일 ───────────────────────────────────────────────────────────────
 
-function loadRegistry() {
-  if (!fs.existsSync(REGISTRY_FILE)) return {};
-  const raw = fs.readFileSync(REGISTRY_FILE, 'utf8');
+function loadState() {
   try {
-    return JSON.parse(raw);
-  } catch (e) {
-    // 손상된 파일 — 백업 후 에러 보고 (조용히 빈 객체 반환하면 데이터 유실)
-    const backup = REGISTRY_FILE + '.corrupted.' + Date.now();
-    fs.writeFileSync(backup, raw, 'utf8');
-    process.stderr.write(JSON.stringify({ error: 'registry_corrupted', backup, message: e.message }) + '\n');
-    process.exit(1);
-  }
-}
-
-function saveRegistry(registry) {
-  // 원자적 쓰기: tmp 파일에 먼저 쓰고 rename (같은 파일시스템이면 atomic)
-  const tmpFile = REGISTRY_FILE + '.tmp';
-  fs.writeFileSync(tmpFile, JSON.stringify(registry, null, 2), 'utf8');
-  fs.renameSync(tmpFile, REGISTRY_FILE);
-}
-
-// 파일 락 — 동시 mark-seen/mark-scraped 호출 시 race condition 방지
-function withRegistryLock(fn) {
-  const lockFile = REGISTRY_FILE + '.lock';
-  const maxRetries = 50; // 최대 5초 대기
-  let acquired = false;
-
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      // O_EXCL: 파일이 없을 때만 생성 (POSIX atomic)
-      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
-      acquired = true;
-      break;
-    } catch {
-      // 락 파일 존재 — 100ms busy-wait
-      const end = Date.now() + 100;
-      while (Date.now() < end) { /* spin */ }
-    }
-  }
-
-  if (!acquired) {
-    process.stderr.write(JSON.stringify({ error: 'lock_timeout', message: 'registry lock 획득 실패 (5초 초과)' }) + '\n');
-    process.exit(1);
-  }
-
-  try {
-    return fn();
-  } finally {
-    try { fs.unlinkSync(lockFile); } catch { /* 무시 */ }
-  }
-}
-
-function loadConfig() {
-  if (!fs.existsSync(CONFIG_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   } catch {
-    return {};
+    return { last_seen_id: 0 };
   }
+}
+
+function saveState(state) {
+  const tmp = STATE_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  fs.renameSync(tmp, STATE_FILE);
 }
 
 // ─── 명령어: init ────────────────────────────────────────────────────────────
@@ -188,37 +134,27 @@ function cmdInit() {
       fs.mkdirSync(dir, { recursive: true });
     }
   }
-
-  if (!fs.existsSync(REGISTRY_FILE)) {
-    fs.writeFileSync(REGISTRY_FILE, '{}', 'utf8');
-  }
-
-  if (!fs.existsSync(CONFIG_FILE)) {
-    const defaultConfig = {
-      categories: DEFAULT_CATEGORIES,
-      tags: DEFAULT_TAGS,
-      per_page: PER_PAGE,
-      created_at: new Date().toISOString(),
-    };
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaultConfig, null, 2), 'utf8');
-  }
-
-  console.log(JSON.stringify({ ok: true, dirs, registry: REGISTRY_FILE, config: CONFIG_FILE }));
+  console.log(JSON.stringify({ ok: true, dirs }));
 }
 
-// ─── 명령어: discover ────────────────────────────────────────────────────────
+// ─── 명령어: discover [page] ─────────────────────────────────────────────────
 
-async function cmdDiscover() {
-  const config = loadConfig();
-  const categories = config.categories || DEFAULT_CATEGORIES;
-  const tags = config.tags || DEFAULT_TAGS;
-  const perPage = config.per_page || PER_PAGE;
+async function cmdDiscover(page) {
+  const pageNum = Math.max(1, parseInt(page || '1', 10));
+  const state = loadState();
 
-  const apiUrl = `${API_BASE}/posts?per_page=${perPage}&categories=${categories}&tags=${tags}&_fields=${FIELDS}&orderby=date&order=desc`;
+  const apiUrl = new URL(`${API_BASE}/posts`);
+  apiUrl.searchParams.set('categories', DEFAULT_CATEGORIES);
+  apiUrl.searchParams.set('tags', DEFAULT_TAGS);
+  apiUrl.searchParams.set('per_page', String(PER_PAGE));
+  apiUrl.searchParams.set('orderby', 'id');
+  apiUrl.searchParams.set('order', 'desc');
+  apiUrl.searchParams.set('_fields', 'id,title,link,date');
+  if (pageNum > 1) apiUrl.searchParams.set('page', String(pageNum));
 
   let resp;
   try {
-    resp = await httpsGet(apiUrl);
+    resp = await httpsGet(apiUrl.toString());
   } catch (e) {
     console.error(JSON.stringify({ error: 'network', message: e.message }));
     process.exit(1);
@@ -237,32 +173,46 @@ async function cmdDiscover() {
     process.exit(1);
   }
 
-  const registry = loadRegistry();
-  const newPosts = [];
+  // page > 1: 과거 백필 — last_seen_id 필터 건너뜀
+  const newPosts = pageNum > 1 ? posts : posts.filter((p) => p.id > state.last_seen_id);
 
-  for (const post of posts) {
-    const url = post.link;
-    if (registry[url]) continue; // 이미 확인함
-
-    // 태그 이름 추출 (REST API는 tag slug 배열을 별도로 안 줌 — 제목에서 태그 힌트)
-    const tags = Array.isArray(post.tags) && post.tags.length > 0
-      ? post.tags  // 태그 ID 배열 (숫자)
-      : [];
-
-    newPosts.push({
-      id: post.id,
-      title: post.title?.rendered ? stripHtml(post.title.rendered) : `공고 ${post.id}`,
-      url,
-      date: post.date ? post.date.slice(0, 10) : '',
-      tags,  // ID 배열 (fetch-post에서 slug로 변환)
-    });
+  if (newPosts.length === 0) {
+    console.log(JSON.stringify({ ok: true, new: 0 }));
+    return;
   }
 
-  console.log(JSON.stringify({
-    new: newPosts,
-    total_new: newPosts.length,
-    total_checked: posts.length,
+  newPosts.sort((a, b) => a.id - b.id);
+
+  const jobs = newPosts.map((p) => ({
+    id: p.id,
+    title: stripHtml(p.title?.rendered || `공고 ${p.id}`),
+    url: p.link,
+    date: p.date ? p.date.slice(0, 10) : undefined,
   }));
+
+  const chatJid = process.env.NANOCLAW_CHAT_JID;
+  if (!chatJid) {
+    console.error(JSON.stringify({ error: 'NANOCLAW_CHAT_JID not set' }));
+    process.exit(1);
+  }
+
+  fs.mkdirSync(IPC_MESSAGES_DIR, { recursive: true });
+  const filepath = path.join(IPC_MESSAGES_DIR, `job-scraper-${Date.now()}.json`);
+  const tmp = filepath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify({
+    type: 'keyboard_message',
+    chatJid,
+    text: `🆕 새 채용공고 ${jobs.length}건`,
+    jobs,
+  }));
+  fs.renameSync(tmp, filepath);
+
+  // page 1만 state 갱신 (백필은 state 변경 안 함)
+  if (pageNum === 1) {
+    saveState({ last_seen_id: Math.max(...jobs.map((j) => j.id)) });
+  }
+
+  console.log(JSON.stringify({ ok: true, new: jobs.length }));
 }
 
 // ─── 명령어: fetch-post <id> ─────────────────────────────────────────────────
@@ -327,58 +277,6 @@ async function cmdFetchPost(id) {
   }));
 }
 
-// ─── 명령어: discover-latest <n> ────────────────────────────────────────────
-// 레지스트리와 무관하게 최신 N개 공고를 반환 (스크랩 여부 표시 포함)
-
-async function cmdDiscoverLatest(n, page) {
-  const count = parseInt(n, 10);
-  if (!count || count < 1) {
-    console.error(JSON.stringify({ error: 'discover-latest requires a positive integer <n>' }));
-    process.exit(1);
-  }
-  const pageNum = Math.max(1, parseInt(page, 10) || 1);
-
-  const config = loadConfig();
-  const categories = config.categories || DEFAULT_CATEGORIES;
-  const tags = config.tags || DEFAULT_TAGS;
-
-  const apiUrl = `${API_BASE}/posts?per_page=${Math.min(count, 100)}&page=${pageNum}&categories=${categories}&tags=${tags}&_fields=${FIELDS}&orderby=date&order=desc`;
-
-  let resp;
-  try {
-    resp = await httpsGet(apiUrl);
-  } catch (e) {
-    console.error(JSON.stringify({ error: 'network', message: e.message }));
-    process.exit(1);
-  }
-
-  if (resp.status !== 200) {
-    console.error(JSON.stringify({ error: 'api', status: resp.status, body: resp.body.slice(0, 200) }));
-    process.exit(1);
-  }
-
-  let posts;
-  try {
-    posts = JSON.parse(resp.body);
-  } catch (e) {
-    console.error(JSON.stringify({ error: 'parse', message: e.message }));
-    process.exit(1);
-  }
-
-  const registry = loadRegistry();
-
-  const result = posts.slice(0, count).map((post) => ({
-    id: post.id,
-    title: post.title?.rendered ? stripHtml(post.title.rendered) : `공고 ${post.id}`,
-    url: post.link,
-    date: post.date ? post.date.slice(0, 10) : '',
-    tags: Array.isArray(post.tags) ? post.tags : [],
-    registry_status: registry[post.link]?.status ?? 'new',  // 'new' | 'seen' | 'scraped'
-  }));
-
-  console.log(JSON.stringify({ posts: result, total: result.length, page: pageNum }));
-}
-
 // ─── 명령어: next-seq ────────────────────────────────────────────────────────
 
 function cmdNextSeq() {
@@ -399,54 +297,6 @@ function cmdNextSeq() {
   console.log(JSON.stringify({ next: max + 1 }));
 }
 
-// ─── 명령어: mark-all-seen ───────────────────────────────────────────────────
-// 현재 API에서 조회되는 모든 공고를 "seen"으로 일괄 마킹 (최초 기준점 설정용)
-
-async function cmdMarkAllSeen() {
-  const config = loadConfig();
-  const categories = config.categories || DEFAULT_CATEGORIES;
-  const tags = config.tags || DEFAULT_TAGS;
-  const perPage = config.per_page || PER_PAGE;
-
-  const apiUrl = `${API_BASE}/posts?per_page=${perPage}&categories=${categories}&tags=${tags}&_fields=id,link&orderby=date&order=desc`;
-
-  let resp;
-  try {
-    resp = await httpsGet(apiUrl);
-  } catch (e) {
-    console.error(JSON.stringify({ error: 'network', message: e.message }));
-    process.exit(1);
-  }
-
-  if (resp.status !== 200) {
-    console.error(JSON.stringify({ error: 'api', status: resp.status }));
-    process.exit(1);
-  }
-
-  let posts;
-  try {
-    posts = JSON.parse(resp.body);
-  } catch (e) {
-    console.error(JSON.stringify({ error: 'parse', message: e.message }));
-    process.exit(1);
-  }
-
-  let marked = 0;
-  const now = new Date().toISOString();
-  withRegistryLock(() => {
-    const registry = loadRegistry();
-    for (const post of posts) {
-      if (!registry[post.link]) {
-        registry[post.link] = { status: 'seen', at: now };
-        marked++;
-      }
-    }
-    saveRegistry(registry);
-  });
-  console.log(JSON.stringify({ ok: true, marked, total: posts.length }));
-}
-
-
 // ─── 진입점 ──────────────────────────────────────────────────────────────────
 
 const [,, cmd, ...args] = process.argv;
@@ -455,17 +305,11 @@ switch (cmd) {
   case 'init':
     cmdInit();
     break;
-  case 'discover-latest':
-    await cmdDiscoverLatest(args[0] || '10', args[1] || '1');
+  case 'discover':
+    await cmdDiscover(args[0]);
     break;
   case 'next-seq':
     cmdNextSeq();
-    break;
-  case 'mark-all-seen':
-    await cmdMarkAllSeen();
-    break;
-  case 'discover':
-    await cmdDiscover();
     break;
   case 'fetch-post':
     if (!args[0]) {
@@ -477,7 +321,7 @@ switch (cmd) {
   default:
     console.error(JSON.stringify({
       error: 'unknown command',
-      usage: 'scraper.mjs <init|discover|discover-latest <n> [page]|mark-all-seen|next-seq|fetch-post <id>>',
+      usage: 'scraper.mjs <init|discover [page]|next-seq|fetch-post <id>>',
     }));
     process.exit(1);
 }

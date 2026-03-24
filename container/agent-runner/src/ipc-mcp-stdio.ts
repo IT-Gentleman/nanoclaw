@@ -63,37 +63,6 @@ server.tool(
 );
 
 server.tool(
-  'send_job_list',
-  'Send a numbered job listing to the user with /scrape command instructions. User replies with /scrape 1,3,5 (select), /scrape all, or /scrape skip. Call this INSTEAD of send_message when presenting job discovery results. Exit immediately after calling this.',
-  {
-    text: z.string().describe('Header message above the keyboard'),
-    jobs: z.union([
-      z.array(z.object({
-        id: z.number().describe('Unique post ID'),
-        title: z.string().describe('Job posting title as-is from the source'),
-        url: z.string().describe('Job posting URL'),
-        date: z.string().optional().describe('Posting date'),
-      })),
-      z.string().describe('JSON string of jobs array (auto-parsed)'),
-    ]).describe('List of discovered job postings — accepts array or JSON string'),
-  },
-  async (args) => {
-    const jobs = typeof args.jobs === 'string' ? JSON.parse(args.jobs) : args.jobs;
-    writeIpcFile(MESSAGES_DIR, {
-      type: 'keyboard_message',
-      chatJid,
-      text: args.text,
-      jobs,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    });
-    return {
-      content: [{ type: 'text' as const, text: `Job list sent with ${jobs.length} postings. Exit now — user will reply with /scrape command.` }],
-    };
-  },
-);
-
-server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.
 
